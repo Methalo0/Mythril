@@ -1,0 +1,20 @@
+{
+  "appId": "com.methalo11885260.mythril",
+  "productName": "Mythril",
+  "copyright": "MetHalo11885260",
+  "win": {
+    "target": "msi",
+    "icon": "icons/icon.ico",
+    "executableName": "mythril.exe"
+  },
+  "msi": {
+    "oneClick": false,
+    "perMachine": false,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "Mythril"
+  },
+  "directories": {
+    "output": "release"
+  }
+}

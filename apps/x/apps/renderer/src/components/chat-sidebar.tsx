@@ -1,0 +1,633 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ArrowLeft, ArrowRight, ChevronLeft, ChevronRight, Minus, X } from 'lucide-react'
+
+import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
+import { readAssistantPreference, writeAssistantPreference } from '@/lib/assistant-dock'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { ChatHeader } from '@/components/chat-header'
+import { CodeSessionHeader, type CodeSessionHeaderProps } from '@/components/code/code-session-header'
+import { type PromptInputMessage, type Mention } from '@/components/ai-elements/prompt-input'
+import { FileCardProvider } from '@/contexts/file-card-context'
+import { TabBar, type ChatTab } from '@/components/tab-bar'
+import { type CallPreset, type PermissionMode, type StagedAttachment, type ModelSelection } from '@/components/chat-input-with-mentions'
+import { ChatSessionPane, ChatSessionComposer } from '@/components/chat-session'
+import type { QueuedSessionMessage } from '@x/shared/src/sessions.js'
+import { useTabMeta } from '@/lib/tab-meta'
+import { useSidebar } from '@/components/ui/sidebar'
+import type { ChatPaneSize } from '@/contexts/theme-context'
+import type { PermissionDecision } from '@x/shared/src/code-mode.js'
+import {
+  type ChatViewportAnchorState,
+  type ChatTabViewState,
+  type ConversationItem,
+  type PermissionResponse,
+  type TokenUsage,
+  createEmptyChatTabViewState,
+} from '@/lib/chat-conversation'
+
+const MIN_WIDTH = 360
+const MAX_WIDTH = 1600
+const MIN_MAIN_PANE_WIDTH = 420
+const MIN_MAIN_PANE_RATIO = 0.3
+const DEFAULT_WIDTH = 460
+const RIGHT_PANE_WIDTH_STORAGE_KEY = 'x:right-pane-width'
+
+function clampPaneWidth(width: number, maxWidth: number = MAX_WIDTH): number {
+  const boundedMax = Math.max(0, Math.min(MAX_WIDTH, maxWidth))
+  const boundedMin = Math.min(MIN_WIDTH, boundedMax)
+  return Math.min(boundedMax, Math.max(boundedMin, width))
+}
+
+function getInitialPaneWidth(defaultWidth: number): number {
+  const fallback = clampPaneWidth(defaultWidth)
+  if (typeof window === 'undefined') return fallback
+  try {
+    const raw = window.localStorage.getItem(RIGHT_PANE_WIDTH_STORAGE_KEY)
+    if (!raw) return fallback
+    const parsed = Number(raw)
+    if (!Number.isFinite(parsed)) return fallback
+    return clampPaneWidth(parsed)
+  } catch {
+    return fallback
+  }
+}
+
+export interface ChatSidebarProps {
+  floating?: boolean
+  keepMounted?: boolean
+  onMinimize?: () => void
+  onCloseTab?: () => void
+  defaultWidth?: number
+  isOpen?: boolean
+  isMaximized?: boolean
+  placement?: 'middle' | 'right'
+  paneSize?: ChatPaneSize
+  className?: string
+  codeSessionTabs?: React.ReactNode
+  chatTabs: ChatTab[]
+  onSwitchChatTab: (tabId: string) => void
+  onCloseChatTabs: (tabIds: string[]) => void
+  activeChatTabId: string
+  getChatTabTitle: (tab: ChatTab) => string
+  onNewChatTab: () => void
+  recentRuns?: { id: string; title?: string; createdAt: string }[]
+  onSelectRun?: (runId: string) => void
+  onOpenChatHistory?: () => void
+  onOpenFullScreen?: () => void
+  /** History navigation, shown in the header only while maximized — the pane
+      then covers the main ContentHeader that normally carries these. */
+  onNavigateBack?: () => void
+  onNavigateForward?: () => void
+  canNavigateBack?: boolean
+  canNavigateForward?: boolean
+  conversation: ConversationItem[]
+  currentAssistantMessage: string
+  currentReasoning?: string
+  sessionUsage?: TokenUsage
+  chatTabStates?: Record<string, ChatTabViewState>
+  viewportAnchors?: Record<string, ChatViewportAnchorState>
+  isProcessing: boolean
+  isReasoning?: boolean
+  isWaitingOnHuman?: boolean
+  isStopping?: boolean
+  onStop?: () => void
+  onSubmit: (message: PromptInputMessage, mentions?: Mention[], attachments?: StagedAttachment[], searchEnabled?: boolean, codeMode?: 'claude' | 'codex', permissionMode?: PermissionMode) => void
+  /** Pending-queue mirror for the ACTIVE tab's session (single store — see App). */
+  queuedForActive?: QueuedSessionMessage[]
+  onRemoveQueued?: (queueId: string) => void
+  onPullQueued?: (queueId: string) => void
+  knowledgeFiles?: string[]
+  recentFiles?: string[]
+  visibleFiles?: string[]
+  runId?: string | null
+  presetMessage?: string
+  onPresetMessageConsumed?: () => void
+  getInitialDraft?: (tabId: string) => string | undefined
+  onDraftChangeForTab?: (tabId: string, text: string) => void
+  onSelectionChangeForTab?: (tabId: string, selection: ModelSelection | null) => void
+  getInitialSelection?: (tabId: string) => ModelSelection | null
+  /** Last-turn selection for the ACTIVE tab's session (single store — see App). */
+  restoredSelectionForActive?: ModelSelection | null
+  workDirByTab?: Record<string, string | null>
+  /** Composer locks for runs bound to Code-section sessions (cwd + agent frozen). */
+  codeSessionLocks?: Record<string, { cwd: string; agent: 'claude' | 'codex' }>
+  /**
+   * Set while a Mythril-mode code session owns this pane: the chat is pinned to
+   * the session, so the chat switcher / new-chat / history affordances hide.
+   */
+  // Set while the chat is bound to a coding session: the header becomes the
+  // session's (title, settings, drawer toggles) instead of the chat switcher.
+  pinnedToCodeSession?: CodeSessionHeaderProps | null
+  onWorkDirChangeForTab?: (tabId: string, value: string | null) => void
+  pendingAskHumanRequests?: ChatTabViewState['pendingAskHumanRequests']
+  allPermissionRequests?: ChatTabViewState['allPermissionRequests']
+  permissionResponses?: ChatTabViewState['permissionResponses']
+  autoPermissionDecisions?: ChatTabViewState['autoPermissionDecisions']
+  onPermissionResponse?: (toolCallId: string, subflow: string[], response: PermissionResponse) => void
+  onAskHumanResponse?: (toolCallId: string, subflow: string[], response: string) => void
+  onCodePermissionResponse?: (toolCallId: string, requestId: string, decision: PermissionDecision) => void | Promise<void>
+  isToolOpenForTab?: (tabId: string, toolId: string) => boolean | undefined
+  onToolOpenChangeForTab?: (tabId: string, toolId: string, open: boolean) => void
+  onOpenKnowledgeFile?: (path: string) => void
+  onOpenFile?: (path: string) => void
+  onActivate?: () => void
+  collapsedLeftPaddingPx?: number
+  // Voice / TTS props
+  isRecording?: boolean
+  recordingText?: string
+  recordingState?: 'connecting' | 'listening' | 'stopping'
+  audioLevelsRef?: React.MutableRefObject<number[]>
+  onStartRecording?: () => void
+  onSubmitRecording?: () => void | Promise<void>
+  onCancelRecording?: () => void
+  voiceAvailable?: boolean
+  inCall?: boolean
+  callOnThisChat?: boolean
+  onStartCall?: (preset: CallPreset) => void
+  onEndCall?: () => void
+  callAvailable?: boolean
+  onComposioConnected?: (toolkitSlug: string, tabId?: string) => void
+}
+
+export function ChatSidebar({
+  floating = false,
+  keepMounted = false,
+  onMinimize,
+  onCloseTab,
+  defaultWidth = DEFAULT_WIDTH,
+  isOpen = true,
+  isMaximized = false,
+  placement = 'right',
+  paneSize = 'chat-smaller',
+  className,
+  codeSessionTabs,
+  chatTabs,
+  onSwitchChatTab,
+  onCloseChatTabs,
+  activeChatTabId,
+  getChatTabTitle,
+  onNewChatTab,
+  recentRuns = [],
+  onSelectRun,
+  onOpenChatHistory,
+  onOpenFullScreen,
+  onNavigateBack,
+  onNavigateForward,
+  canNavigateBack = false,
+  canNavigateForward = false,
+  conversation,
+  currentAssistantMessage,
+  currentReasoning = '',
+  sessionUsage = {},
+  chatTabStates = {},
+  viewportAnchors = {},
+  isProcessing,
+  isReasoning = false,
+  isWaitingOnHuman = false,
+  isStopping,
+  onStop,
+  onSubmit,
+  queuedForActive,
+  onRemoveQueued,
+  onPullQueued,
+  knowledgeFiles = [],
+  recentFiles = [],
+  visibleFiles = [],
+  runId,
+  presetMessage,
+  onPresetMessageConsumed,
+  getInitialDraft,
+  onDraftChangeForTab,
+  onSelectionChangeForTab,
+  getInitialSelection,
+  restoredSelectionForActive,
+  workDirByTab = {},
+  codeSessionLocks = {},
+  pinnedToCodeSession = null,
+  onWorkDirChangeForTab,
+  pendingAskHumanRequests = new Map(),
+  allPermissionRequests = new Map(),
+  permissionResponses = new Map(),
+  autoPermissionDecisions = new Map(),
+  onPermissionResponse,
+  onAskHumanResponse,
+  onCodePermissionResponse,
+  isToolOpenForTab,
+  onToolOpenChangeForTab,
+  onOpenKnowledgeFile,
+  onOpenFile,
+  onActivate,
+  collapsedLeftPaddingPx = 196,
+  isRecording,
+  recordingText,
+  recordingState,
+  audioLevelsRef,
+  onStartRecording,
+  onSubmitRecording,
+  onCancelRecording,
+  voiceAvailable,
+  inCall,
+  callOnThisChat,
+  onStartCall,
+  onEndCall,
+  callAvailable,
+  onComposioConnected,
+}: ChatSidebarProps) {
+  const { state: sidebarState } = useSidebar()
+  // Content-reported tab meta (see lib/tab-meta.ts): the header title prefers
+  // what the chat content reports for the active tab, with the App-derived
+  // getChatTabTitle prop as the fallback for unclaimed titles.
+  const activeTabMeta = useTabMeta(activeChatTabId)
+  const [width, setWidth] = useState(() => getInitialPaneWidth(defaultWidth))
+  const [isResizing, setIsResizing] = useState(false)
+  const [showContent, setShowContent] = useState(isOpen)
+  const [floatingSize, setFloatingSize] = useState(() => {
+    const fallback = { width: 460, height: 600 }
+    try {
+      const saved = JSON.parse(readAssistantPreference('mythril-assistant-floating-size') ?? 'null')
+      if (Number.isFinite(saved?.width) && Number.isFinite(saved?.height)) {
+        return { width: Math.max(360, Math.min(900, saved.width)), height: Math.max(320, Math.min(1000, saved.height)) }
+      }
+    } catch { return fallback }
+    return fallback
+  })
+  const [localPresetMessage, setLocalPresetMessage] = useState<string | undefined>(undefined)
+
+  const paneRef = useRef<HTMLDivElement>(null)
+  const startXRef = useRef(0)
+  const startWidthRef = useRef(0)
+  const prevIsMaximizedRef = useRef(isMaximized)
+  const justToggledMaximize = prevIsMaximizedRef.current !== isMaximized
+  const isMiddlePlacement = placement === 'middle'
+  const isResizable = paneSize === 'chat-smaller'
+
+  const getMaxAllowedWidth = useCallback(() => {
+    if (typeof window === 'undefined') return MAX_WIDTH
+    const paneElement = paneRef.current
+    const splitContainer = paneElement?.parentElement
+    const mainPane = splitContainer?.querySelector<HTMLElement>('[data-slot="sidebar-inset"]')
+    const paneWidth = paneElement?.getBoundingClientRect().width ?? 0
+    const mainPaneWidth = mainPane?.getBoundingClientRect().width ?? 0
+    const splitWidth = paneWidth + mainPaneWidth
+    const fallbackWidth = splitContainer?.clientWidth ?? window.innerWidth
+    const availableSplitWidth = splitWidth > 0 ? splitWidth : fallbackWidth
+    const minMainPaneWidth = Math.min(
+      availableSplitWidth,
+      Math.max(
+        MIN_MAIN_PANE_WIDTH,
+        Math.floor(availableSplitWidth * MIN_MAIN_PANE_RATIO)
+      )
+    )
+    return Math.max(0, availableSplitWidth - minMainPaneWidth)
+  }, [])
+
+  useEffect(() => {
+    if (keepMounted) {
+      setShowContent(true)
+      return
+    }
+    if (isOpen) {
+      const timer = setTimeout(() => setShowContent(true), 150)
+      return () => clearTimeout(timer)
+    }
+    setShowContent(false)
+  }, [isOpen, keepMounted])
+
+  useEffect(() => {
+    if (!floating || !isOpen) return
+    const pane = paneRef.current
+    if (!pane) return
+    const observer = new ResizeObserver(() => {
+      const bounds = pane.getBoundingClientRect()
+      writeAssistantPreference('mythril-assistant-floating-size', JSON.stringify({ width: bounds.width, height: bounds.height }))
+    })
+    observer.observe(pane)
+    return () => observer.disconnect()
+  }, [floating, isOpen])
+
+  useEffect(() => {
+    prevIsMaximizedRef.current = isMaximized
+  }, [isMaximized])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(RIGHT_PANE_WIDTH_STORAGE_KEY, String(width))
+    } catch {
+      // Ignore persistence failures and keep in-memory behavior.
+    }
+  }, [width])
+
+  useEffect(() => {
+    const clampToAvailableWidth = () => {
+      const maxAllowedWidth = getMaxAllowedWidth()
+      setWidth((prev) => clampPaneWidth(prev, maxAllowedWidth))
+    }
+
+    clampToAvailableWidth()
+    window.addEventListener('resize', clampToAvailableWidth)
+    return () => window.removeEventListener('resize', clampToAvailableWidth)
+  }, [getMaxAllowedWidth])
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    startXRef.current = e.clientX
+    startWidthRef.current = width
+    setIsResizing(true)
+
+    const handleMouseMove = (event: MouseEvent) => {
+      const delta = isMiddlePlacement
+        ? event.clientX - startXRef.current
+        : startXRef.current - event.clientX
+      const maxAllowedWidth = getMaxAllowedWidth()
+      setWidth(clampPaneWidth(startWidthRef.current + delta, maxAllowedWidth))
+    }
+
+    const handleMouseUp = () => {
+      setIsResizing(false)
+      document.removeEventListener('mousemove', handleMouseMove)
+      document.removeEventListener('mouseup', handleMouseUp)
+    }
+
+    document.addEventListener('mousemove', handleMouseMove)
+    document.addEventListener('mouseup', handleMouseUp)
+  }, [width, getMaxAllowedWidth, isMiddlePlacement])
+
+  const activeTabState = useMemo<ChatTabViewState>(() => ({
+    runId: runId ?? null,
+    conversation,
+    currentAssistantMessage,
+    currentReasoning,
+    sessionUsage,
+    pendingAskHumanRequests,
+    allPermissionRequests,
+    permissionResponses,
+    autoPermissionDecisions,
+  }), [
+    runId,
+    conversation,
+    currentAssistantMessage,
+    currentReasoning,
+    sessionUsage,
+    pendingAskHumanRequests,
+    allPermissionRequests,
+    permissionResponses,
+    autoPermissionDecisions,
+  ])
+  const emptyTabState = useMemo<ChatTabViewState>(() => createEmptyChatTabViewState(), [])
+  const getTabState = useCallback((tabId: string): ChatTabViewState => {
+    if (tabId === activeChatTabId) return activeTabState
+    return chatTabStates[tabId] ?? emptyTabState
+  }, [activeChatTabId, activeTabState, chatTabStates, emptyTabState])
+  const paneStyle = useMemo<React.CSSProperties>(() => {
+    if (floating) {
+      return {
+        position: 'fixed', right: 12, bottom: 52, zIndex: 30,
+        width: floatingSize.width, height: floatingSize.height,
+        maxWidth: 'calc(100vw - 88px)', maxHeight: 'calc(100dvh - 108px)',
+        minWidth: 'min(360px, calc(100vw - 88px))', minHeight: 'min(320px, calc(100dvh - 108px))',
+        resize: 'both', display: isOpen ? undefined : 'none',
+      }
+    }
+    if (!isOpen) {
+      return { width: 0, flex: '0 0 auto' }
+    }
+    if (isMaximized) {
+      // In maximize mode the pane should grow into the freed left space,
+      // not add extra width to the right and overflow the app viewport.
+      return { width: 0, flex: '1 1 auto' }
+    }
+    if (paneSize === 'chat-equal' || paneSize === 'chat-bigger') {
+      return { width: 0, flex: '1 1 0' }
+    }
+    return { width, flex: '0 0 auto' }
+  }, [isOpen, isMaximized, paneSize, width, floating, floatingSize])
+
+  return (
+    <div
+      ref={paneRef}
+      data-chat-sidebar-root
+      role={floating ? 'region' : undefined}
+      aria-label={floating ? 'Assistant conversation' : undefined}
+      aria-hidden={!isOpen}
+      inert={!isOpen}
+      onKeyDown={(event) => {
+        if (floating && event.altKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) {
+          event.preventDefault()
+          const bounds = paneRef.current?.getBoundingClientRect()
+          if (bounds) setFloatingSize({
+            width: Math.max(360, Math.min(window.innerWidth - 88, bounds.width + (event.key === 'ArrowLeft' ? 20 : event.key === 'ArrowRight' ? -20 : 0))),
+            height: Math.max(320, Math.min(window.innerHeight - 108, bounds.height + (event.key === 'ArrowUp' ? 20 : event.key === 'ArrowDown' ? -20 : 0))),
+          })
+          return
+        }
+        if (event.key !== 'Escape' || event.defaultPrevented || !floating) return
+        if ((event.target as HTMLElement).closest('[role="dialog"], [role="menu"], [role="listbox"]')) return
+        event.preventDefault()
+        onMinimize?.()
+      }}
+      onMouseDownCapture={onActivate}
+      onFocusCapture={onActivate}
+      className={cn(
+        'relative flex min-w-0 flex-col overflow-hidden bg-background',
+        isMiddlePlacement ? 'border-r border-border' : 'border-l border-border',
+        !floating && !isResizing && !justToggledMaximize && 'transition-[width] duration-200 ease-linear motion-reduce:transition-none',
+        floating && 'rounded-xl border border-border shadow-2xl',
+        className
+      )}
+      style={paneStyle}
+    >
+      {floating && <span className="sr-only">Resize with Alt and arrow keys. Escape minimizes this chat.</span>}
+      {!floating && !isMaximized && isResizable && (
+        <div
+          onMouseDown={handleMouseDown}
+          className={cn(
+            'absolute inset-y-0 z-20 w-4 cursor-col-resize',
+            isMiddlePlacement ? 'right-0 translate-x-1/2' : 'left-0 -translate-x-1/2',
+            'after:absolute after:inset-y-0 after:left-1/2 after:w-[2px] after:transition-colors',
+            'hover:after:bg-sidebar-border',
+            isResizing && 'after:bg-primary'
+          )}
+        />
+      )}
+
+      {showContent && (
+        <>
+          <header
+            className={cn(floating ? 'titlebar-no-drag' : 'titlebar-drag-region', 'flex h-10 shrink-0 items-stretch border-b border-border bg-sidebar')}
+            style={{
+              paddingLeft: isMaximized ? (sidebarState === 'collapsed' ? collapsedLeftPaddingPx : 12) : undefined,
+              paddingRight: isMaximized ? 12 : undefined,
+              transition: isMaximized ? 'padding-left 200ms linear' : undefined,
+            }}
+          >
+            {/* Maximized, the pane covers the main ContentHeader — carry the
+                same back/forward pair so history navigation stays reachable
+                (navigating restores the underlying view and un-maximizes). */}
+            {isMaximized && onNavigateBack && onNavigateForward && (
+              <>
+                <div className="titlebar-no-drag flex items-center gap-1 pr-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={onNavigateBack}
+                    disabled={!canNavigateBack}
+                    className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:opacity-30 disabled:pointer-events-none"
+                    aria-label="Go back"
+                  >
+                    <ChevronLeft className="size-5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onNavigateForward}
+                    disabled={!canNavigateForward}
+                    className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:opacity-30 disabled:pointer-events-none"
+                    aria-label="Go forward"
+                  >
+                    <ChevronRight className="size-5" />
+                  </button>
+                </div>
+                <div className="titlebar-no-drag self-stretch w-px bg-border/70" aria-hidden="true" />
+              </>
+            )}
+            {pinnedToCodeSession ? (
+              <CodeSessionHeader {...pinnedToCodeSession} />
+            ) : (
+              <ChatHeader
+                activeTitle={(() => {
+                  const activeTab = chatTabs.find((tab) => tab.id === activeChatTabId)
+                  if (!activeTab) return 'New chat'
+                  return activeTabMeta.title ?? getChatTabTitle(activeTab)
+                })()}
+                onNewChatTab={onNewChatTab}
+                recentRuns={recentRuns}
+                activeRunId={runId}
+                sessionUsage={activeTabState.sessionUsage}
+                onSelectRun={onSelectRun}
+                onOpenChatHistory={onOpenChatHistory}
+              />
+            )}
+            {onOpenFullScreen && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={onOpenFullScreen}
+                    className="titlebar-no-drag my-1 mr-2 h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
+                    aria-label={isMaximized ? (onMinimize ? 'Restore chat panel' : 'Dock chat to side pane') : 'Expand chat'}
+                  >
+                    {isMaximized
+                      ? (isMiddlePlacement ? <ArrowLeft className="size-5" /> : <ArrowRight className="size-5" />)
+                      : (isMiddlePlacement ? <ArrowRight className="size-5" /> : <ArrowLeft className="size-5" />)}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">{isMaximized ? (onMinimize ? 'Restore chat panel' : 'Dock to side pane') : 'Expand chat'}</TooltipContent>
+              </Tooltip>
+            )}
+            {onMinimize && <Button variant="ghost" size="icon" onClick={onMinimize} className="titlebar-no-drag my-1 size-8 shrink-0" aria-label="Minimize chat" title="Minimize chat"><Minus className="size-4" /></Button>}
+            {onCloseTab && <Button variant="ghost" size="icon" onClick={onCloseTab} className="titlebar-no-drag my-1 mr-1 size-8 shrink-0" aria-label="Close chat tab" title="Close tab — conversation stays in history"><X className="size-4" /></Button>}
+          </header>
+
+          {codeSessionTabs ?? <div className="mythril-header flex shrink-0 border-b border-border">
+            <TabBar tabs={chatTabs} activeTabId={activeChatTabId} getTabId={(tab) => tab.id}
+              getTabTitle={getChatTabTitle} onSwitchTab={onSwitchChatTab}
+              onCloseTab={(id) => onCloseChatTabs([id])} onCloseTabs={onCloseChatTabs} layout="scroll" />
+          </div>}
+
+          <FileCardProvider onOpenKnowledgeFile={onOpenKnowledgeFile ?? (() => {})} onOpenFile={onOpenFile}>
+            <div className="flex min-h-0 flex-1 flex-col">
+              {/* Pane padding lives here, on the container — the shared chat pane renders identically on every surface. */}
+              <div className="relative min-h-0 flex-1 px-3">
+                {chatTabs.map((tab) => {
+                  const isActive = tab.id === activeChatTabId && isOpen
+                  return (
+                    <ChatSessionPane
+                      // Keyed by chat identity — see App's chat panel key.
+                      key={tab.chatId}
+                      tab={tab}
+                      isActive={isActive}
+                      tabState={getTabState(tab.id)}
+                      viewportAnchor={viewportAnchors[tab.id]}
+                      onPickPrompt={setLocalPresetMessage}
+                      isToolOpenForTab={(tabId, toolId) => isToolOpenForTab?.(tabId, toolId)}
+                      setToolOpenForTab={(tabId, toolId, open) => onToolOpenChangeForTab?.(tabId, toolId, open)}
+                      onPermissionResponse={onPermissionResponse}
+                      onAskHumanResponse={onAskHumanResponse}
+                      activeIsWorking={isProcessing && !isWaitingOnHuman}
+                      activeIsProcessing={isProcessing}
+                      activeIsReasoning={isReasoning}
+                      onCodePermissionResponse={onCodePermissionResponse}
+                      onComposioConnected={(slug) => onComposioConnected?.(slug, tab.id)}
+                      emptyStateVariant={pinnedToCodeSession ? 'code' : 'default'}
+                      isCodeSession={!!(tab.runId && codeSessionLocks[tab.runId])}
+                    />
+                  )
+                })}
+              </div>
+
+              {/* mythril-composer-dock drops the utility shadow (same as the
+                  full-screen dock): the gradient below does the scroll fade,
+                  so the docked pane carries no container drop shadow. */}
+              <div className={cn('mythril-composer-dock sticky bottom-0 z-10 bg-background pt-0 shadow-lg', floating ? 'pb-3' : 'pb-12')}>
+                <div className="pointer-events-none absolute inset-x-0 -top-6 h-6 bg-linear-to-t from-background to-transparent" />
+                <div className="mx-auto w-full max-w-4xl px-3">
+                  {chatTabs.map((tab) => {
+                    const isActive = tab.id === activeChatTabId && isOpen
+                    return (
+                      <ChatSessionComposer
+                        // Composer instance per chat — see App's composer key.
+                        key={tab.chatId}
+                        tab={tab}
+                        isActive={isActive}
+                        tabState={getTabState(tab.id)}
+                        knowledgeFiles={knowledgeFiles}
+                        recentFiles={recentFiles}
+                        visibleFiles={visibleFiles}
+                        onSubmit={onSubmit}
+                        onStop={onStop}
+                        activeIsProcessing={isProcessing}
+                        isStopping={isStopping}
+                        queued={isActive ? queuedForActive : undefined}
+                        onRemoveQueued={onRemoveQueued}
+                        onPullQueued={onPullQueued}
+                        presetMessage={localPresetMessage ?? presetMessage}
+                        onPresetMessageConsumed={() => {
+                          setLocalPresetMessage(undefined)
+                          onPresetMessageConsumed?.()
+                        }}
+                        codeSessionLocks={codeSessionLocks}
+                        initialDraft={getInitialDraft?.(tab.id)}
+                        onDraftChange={(tabId, text) => onDraftChangeForTab?.(tabId, text)}
+                        onSelectionChange={(t, selection) => onSelectionChangeForTab?.(t.id, selection)}
+                        initialSelection={getInitialSelection?.(tab.id) ?? null}
+                        restoredSelection={isActive ? restoredSelectionForActive : undefined}
+                        workDirByTab={workDirByTab}
+                        onWorkDirChange={(tabId, v) => onWorkDirChangeForTab?.(tabId, v)}
+                        recordingOverrides={{
+                          isRecording: isActive && isRecording,
+                          recordingText: isActive ? recordingText : undefined,
+                          recordingState: isActive ? recordingState : undefined,
+                          audioLevelsRef,
+                          onStartRecording: isActive ? onStartRecording : undefined,
+                        }}
+                        onSubmitRecording={onSubmitRecording}
+                        onCancelRecording={onCancelRecording}
+                        voiceAvailable={voiceAvailable}
+                        inCall={inCall}
+                        callOnThisChat={callOnThisChat}
+                        onStartCall={onStartCall}
+                        onEndCall={onEndCall}
+                        callAvailable={callAvailable}
+                      />
+                    )
+                  })}
+                </div>
+              </div>
+            </div>
+          </FileCardProvider>
+        </>
+      )}
+    </div>
+  )
+}

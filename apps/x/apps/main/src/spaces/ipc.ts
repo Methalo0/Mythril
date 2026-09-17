@@ -1,0 +1,526 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { BrowserWindow, dialog, shell } from 'electron';
+import { ipc, spaces as spacesShared } from '@x/shared';
+import * as orgs from '@x/core/dist/spaces/orgs.js';
+import * as blobCache from './blob-cache.js';
+import * as spacesOAuth from '@x/core/dist/spaces/oauth.js';
+import { oauthConnectBus } from '@x/core/dist/auth/connector-events.js';
+import { cancelScheduled, listScheduled, scheduleItem } from '@x/core/dist/spaces/scheduler.js';
+import { invokeTopicAgent, stopTopicAgent, topicSessionId } from '@x/core/dist/spaces/topic-agent.js';
+import { onSpaceAgentActivity, startSpaceAgentActivity } from '@x/core/dist/spaces/agent-activity.js';
+import { startSpaceNotifications } from '@x/core/dist/spaces/notify.js';
+import { resolveResponseSession, startSpaceResponseIndex } from '@x/core/dist/spaces/response-index.js';
+import { SpacesClient } from '@x/core/dist/spaces/client.js';
+import { fetchLinkPreview } from './link-preview.js';
+
+type IPCChannels = ipc.IPCChannels;
+
+type InvokeHandler<K extends keyof IPCChannels> = (
+  event: Electron.IpcMainInvokeEvent,
+  args: IPCChannels[K]['req'],
+) => IPCChannels[K]['res'] | Promise<IPCChannels[K]['res']>;
+
+type SpacesHandlers = {
+  'spaces:listOrgs': InvokeHandler<'spaces:listOrgs'>;
+  'spaces:addOrg': InvokeHandler<'spaces:addOrg'>;
+  'spaces:resolveInviteLink': InvokeHandler<'spaces:resolveInviteLink'>;
+  'spaces:joinInvite': InvokeHandler<'spaces:joinInvite'>;
+  'spaces:signInOrg': InvokeHandler<'spaces:signInOrg'>;
+  'spaces:accountState': InvokeHandler<'spaces:accountState'>;
+  'spaces:signInMythril': InvokeHandler<'spaces:signInMythril'>;
+  'spaces:addOrgByAddress': InvokeHandler<'spaces:addOrgByAddress'>;
+  'spaces:createOrg': InvokeHandler<'spaces:createOrg'>;
+  'spaces:apexInfo': InvokeHandler<'spaces:apexInfo'>;
+  'spaces:removeOrg': InvokeHandler<'spaces:removeOrg'>;
+  'spaces:listSpaces': InvokeHandler<'spaces:listSpaces'>;
+  'spaces:createSpace': InvokeHandler<'spaces:createSpace'>;
+  'spaces:renameSpace': InvokeHandler<'spaces:renameSpace'>;
+  'spaces:openDirect': InvokeHandler<'spaces:openDirect'>;
+  'spaces:listMembers': InvokeHandler<'spaces:listMembers'>;
+  'spaces:listOrgMembers': InvokeHandler<'spaces:listOrgMembers'>;
+  'spaces:createInvite': InvokeHandler<'spaces:createInvite'>;
+  'spaces:resolveInvite': InvokeHandler<'spaces:resolveInvite'>;
+  'spaces:acceptInvite': InvokeHandler<'spaces:acceptInvite'>;
+  'spaces:listAssets': InvokeHandler<'spaces:listAssets'>;
+  'spaces:createAsset': InvokeHandler<'spaces:createAsset'>;
+  'spaces:moveAsset': InvokeHandler<'spaces:moveAsset'>;
+  'spaces:deleteAsset': InvokeHandler<'spaces:deleteAsset'>;
+  'spaces:restoreAsset': InvokeHandler<'spaces:restoreAsset'>;
+  'spaces:uploadBlob': InvokeHandler<'spaces:uploadBlob'>;
+  'spaces:saveBlob': InvokeHandler<'spaces:saveBlob'>;
+  'spaces:saveImageUrl': InvokeHandler<'spaces:saveImageUrl'>;
+  'spaces:linkPreview': InvokeHandler<'spaces:linkPreview'>;
+  'spaces:readAsset': InvokeHandler<'spaces:readAsset'>;
+  'spaces:proposeChange': InvokeHandler<'spaces:proposeChange'>;
+  'spaces:assetHistory': InvokeHandler<'spaces:assetHistory'>;
+  'spaces:diff': InvokeHandler<'spaces:diff'>;
+  'spaces:listTopics': InvokeHandler<'spaces:listTopics'>;
+  'spaces:search': InvokeHandler<'spaces:search'>;
+  'spaces:listStream': InvokeHandler<'spaces:listStream'>;
+  'spaces:getMessage': InvokeHandler<'spaces:getMessage'>;
+  'spaces:listThread': InvokeHandler<'spaces:listThread'>;
+  'spaces:postMessage': InvokeHandler<'spaces:postMessage'>;
+  'spaces:createTopic': InvokeHandler<'spaces:createTopic'>;
+  'spaces:manageTopic': InvokeHandler<'spaces:manageTopic'>;
+  'spaces:reactToMessage': InvokeHandler<'spaces:reactToMessage'>;
+  'spaces:deleteMessage': InvokeHandler<'spaces:deleteMessage'>;
+  'spaces:editMessage': InvokeHandler<'spaces:editMessage'>;
+  'spaces:votePoll': InvokeHandler<'spaces:votePoll'>;
+  'spaces:endPoll': InvokeHandler<'spaces:endPoll'>;
+  'spaces:invokeMythril': InvokeHandler<'spaces:invokeMythril'>;
+  'spaces:topicSession': InvokeHandler<'spaces:topicSession'>;
+  'spaces:responseSession': InvokeHandler<'spaces:responseSession'>;
+  'spaces:stopMythril': InvokeHandler<'spaces:stopMythril'>;
+  'spaces:schedule': InvokeHandler<'spaces:schedule'>;
+  'spaces:listScheduled': InvokeHandler<'spaces:listScheduled'>;
+  'spaces:cancelScheduled': InvokeHandler<'spaces:cancelScheduled'>;
+  'spaces:subscribeSpace': InvokeHandler<'spaces:subscribeSpace'>;
+  'spaces:unsubscribeSpace': InvokeHandler<'spaces:unsubscribeSpace'>;
+  'spaces:presence': InvokeHandler<'spaces:presence'>;
+  'spaces:whiteboard': InvokeHandler<'spaces:whiteboard'>;
+  'spaces:bounceLive': InvokeHandler<'spaces:bounceLive'>;
+  'spaces:markRead': InvokeHandler<'spaces:markRead'>;
+  'spaces:followThread': InvokeHandler<'spaces:followThread'>;
+  'spaces:getUnread': InvokeHandler<'spaces:getUnread'>;
+  'spaces:getActivity': InvokeHandler<'spaces:getActivity'>;
+  'spaces:markActivitySeen': InvokeHandler<'spaces:markActivitySeen'>;
+  'spaces:readAll': InvokeHandler<'spaces:readAll'>;
+};
+
+async function orgSummary(record: orgs.OrgRecord): Promise<spacesShared.SpacesOrgSummary> {
+  return {
+    id: record.id,
+    name: record.name,
+    address: record.address,
+    baseUrl: record.baseUrl,
+    memberId: record.auth.memberId,
+    ...(await orgs.describeOrgAuth(record)),
+  };
+}
+
+const orgSummaries = (records: orgs.OrgRecord[]) => Promise.all(records.map(orgSummary));
+
+// A Mythril sign-in or sign-out changes what the apex would list for us:
+// the next org listing re-syncs instead of trusting a recent one.
+oauthConnectBus.subscribe((event) => {
+  if (event.provider === 'mythril') spacesOAuth.invalidateManagedOrgsSync();
+});
+
+const openBrowser = (url: string) => shell.openExternal(url);
+
+// Member-addressed frames (space_added: someone opened a DM with us) have no
+// space subscription to ride — relay them to every window as they arrive; the
+// renderer's orgs store refreshes its listing on them.
+orgs.onMemberFrame((orgId, frame) => broadcastSpacesEvent({ orgId, frame }));
+
+// The agent-activity feed ("my Mythril is working on this thread"): core
+// folds turn/session bus events into per-org lists and emits each whole list
+// on change; windows replace their copy. Started here, before any mention
+// can be sent.
+onSpaceAgentActivity((event) => broadcastSpacesEvent(event));
+void startSpaceAgentActivity().catch((err) => console.error('[spaces] agent activity feed failed to start:', err));
+// The org's `notify` frames become OS notifications (unread arc, 2026-09-10).
+startSpaceNotifications();
+// The per-response index ("which run posted this reply"): same bus, its own
+// consumer — see core/spaces/response-index.
+void startSpaceResponseIndex().catch((err) => console.error('[spaces] response index failed to start:', err));
+
+function broadcastSpacesEvent(event: spacesShared.SpacesBusEvent): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed() && win.webContents) {
+      win.webContents.send('spaces:events', event);
+    }
+  }
+}
+
+// One core-level live subscription per (org, space), fanned out to all windows.
+// The renderer's afterOffset drives replay on first subscribe; core's
+// SpacesLive owns reconnect + resume from the last seen offset after that.
+// Each entry remembers WHICH live client it subscribed on (see subscribeSpace).
+const liveSubscriptions = new Map<string, { live: unknown; unsubscribe: () => void }>();
+
+/**
+ * Spaces IPC handlers, exported as a plain object and spread into the main
+ * `registerIpcHandlers({...})` call in ipc.ts — same convention as
+ * `browserIpcHandlers`. Handlers delegate to core (spaces/orgs.js); everything
+ * the renderer does is attributed 'direct' (the app is the human surface;
+ * agents write through the org's MCP face).
+ */
+export const spacesIpcHandlers: SpacesHandlers = {
+  // The listing first makes the managed orgs match the apex (cheap when a
+  // sync ran moments ago; a failed sync keeps the cached records and logs).
+  'spaces:listOrgs': async () => {
+    await spacesOAuth.syncManagedOrgs({ maxAgeMs: 30_000 }).catch((err) => {
+      console.warn('[spaces] managed org sync failed:', err instanceof Error ? err.message : err);
+    });
+    return { orgs: await orgSummaries(orgs.listOrgs()) };
+  },
+
+  'spaces:accountState': async () => spacesOAuth.accountState(),
+
+  'spaces:signInMythril': async () => ({ orgs: await orgSummaries(await spacesOAuth.signInForSpaces()) }),
+
+  'spaces:addOrgByAddress': async (_event, args) => ({
+    org: await orgSummary(await spacesOAuth.addOrgByAddress({ address: args.address, openBrowser })),
+  }),
+
+  'spaces:addOrg': async (_event, args) => {
+    const org = await orgSummary(await orgs.addDevOrg({ baseUrl: args.baseUrl, memberId: args.memberId }));
+    return { org };
+  },
+
+  'spaces:resolveInviteLink': async (_event, args) => {
+    const { baseUrl, resolved } = await spacesOAuth.resolveInviteLink(args.url);
+    return { baseUrl, resolved };
+  },
+
+  'spaces:joinInvite': async (_event, args) => {
+    const { org, result } = await spacesOAuth.joinViaInviteLink({ url: args.url, openBrowser });
+    return { org: await orgSummary(org), space: result.space };
+  },
+
+  'spaces:signInOrg': async (_event, args) => {
+    const record = orgs.getOrg(args.orgId);
+    if (!record) throw new Error(`unknown org ${args.orgId}`);
+    const updated = await spacesOAuth.signInOrg({ baseUrl: record.baseUrl, openBrowser, orgId: record.id });
+    return { org: await orgSummary(updated) };
+  },
+
+  'spaces:createOrg': async (_event, args) => {
+    const org = await orgSummary(await spacesOAuth.createOrgOnDeployment({ name: args.name, openBrowser }));
+    return { org };
+  },
+
+  'spaces:apexInfo': async () => {
+    try {
+      return { apexDomain: new URL(await spacesOAuth.apexUrl()).host };
+    } catch {
+      return { apexDomain: null };
+    }
+  },
+
+  'spaces:removeOrg': async (_event, args) => {
+    for (const [key, entry] of liveSubscriptions) {
+      if (key.startsWith(`${args.orgId}/`)) {
+        entry.unsubscribe();
+        liveSubscriptions.delete(key);
+      }
+    }
+    await orgs.removeOrg(args.orgId);
+    return { success: true };
+  },
+
+  'spaces:listSpaces': async (_event, args) => {
+    const spaces = await orgs.getClient(args.orgId).listSpaces({ includeDirect: args.includeDirect ?? false });
+    return { spaces };
+  },
+
+  'spaces:createSpace': async (_event, args) => {
+    const space = await orgs.getClient(args.orgId).createSpace(args.name);
+    return { space };
+  },
+
+  'spaces:renameSpace': async (_event, args) => ({
+    space: await orgs.getClient(args.orgId).renameSpace(args.spaceId, args.name),
+  }),
+
+  'spaces:openDirect': async (_event, args) => {
+    const result = await orgs.getClient(args.orgId).openDirect(args.memberId);
+    return result;
+  },
+
+  'spaces:listMembers': async (_event, args) => ({
+    members: await orgs.getClient(args.orgId).listMembers(args.spaceId),
+  }),
+
+  'spaces:listOrgMembers': async (_event, args) => ({
+    members: await orgs.getClient(args.orgId).listOrgMembers(),
+  }),
+
+  'spaces:createInvite': async (_event, args) =>
+    orgs.getClient(args.orgId).createInvite(args.spaceId, args.expiresInHours),
+
+  // Pre-auth: works before the org has been added, so the join flow can show
+  // what's being joined (spec §4). The token is unused on this route.
+  'spaces:resolveInvite': async (_event, args) =>
+    new SpacesClient({ baseUrl: args.baseUrl, token: 'dev-preauth' }).resolveInvite(args.token),
+
+  'spaces:acceptInvite': async (_event, args) => orgs.getClient(args.orgId).acceptInvite(args.token),
+
+  'spaces:listAssets': async (_event, args) => ({
+    entries: await orgs.getClient(args.orgId).listAssets(args.spaceId, {
+      ...(args.includeDeleted !== undefined ? { includeDeleted: args.includeDeleted } : {}),
+    }),
+  }),
+
+  // Namespace ops — the renderer is the human surface, so everything here is
+  // 'direct' (agents move/delete through the org's MCP face, attributed there).
+  'spaces:createAsset': async (_event, args) =>
+    orgs.getClient(args.orgId).createAsset(args.spaceId, {
+      path: args.input.path,
+      // Exactly one of the two variants (contract decision 1, amended).
+      ...(args.input.blob !== undefined ? { blob: args.input.blob } : { newContent: args.input.newContent ?? '' }),
+      ...(args.input.reason ? { reason: args.input.reason } : {}),
+      actingMode: 'direct',
+    }),
+
+  'spaces:moveAsset': async (_event, args) =>
+    orgs.getClient(args.orgId).moveAsset(args.spaceId, {
+      assetId: args.assetId,
+      toPath: args.toPath,
+      baseVersion: args.baseVersion,
+      ...(args.reason ? { reason: args.reason } : {}),
+      actingMode: 'direct',
+    }),
+
+  'spaces:deleteAsset': async (_event, args) =>
+    orgs.getClient(args.orgId).deleteAsset(args.spaceId, {
+      assetId: args.assetId,
+      baseVersion: args.baseVersion,
+      ...(args.reason ? { reason: args.reason } : {}),
+      actingMode: 'direct',
+    }),
+
+  'spaces:restoreAsset': async (_event, args) =>
+    orgs.getClient(args.orgId).restoreAsset(args.spaceId, { assetId: args.assetId, actingMode: 'direct' }),
+
+  // Upload phase 1. Pastes arrive as bytes; drag-drop / picker sends the
+  // absolute path (via electronUtils.getPathForFile) so big files never cross
+  // IPC — main reads them from disk. mime falls back to the filename extension
+  // server-side sniffing has the final word anyway.
+  'spaces:uploadBlob': async (_event, args) => {
+    const bytes = args.bytes !== undefined ? new Uint8Array(Buffer.from(args.bytes, 'base64')) : await fs.readFile(args.filePath!);
+    const blob = await orgs.getClient(args.orgId).uploadBlob(args.spaceId, bytes, {
+      ...(args.mime ? { declaredMime: args.mime } : {}),
+    });
+    return { blob };
+  },
+
+  'spaces:saveBlob': async (event, args) => {
+    const { bytes } = await blobCache.getBlob(args.orgId, args.spaceId, args.hash);
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const options = { defaultPath: path.basename(args.suggestedName ?? args.hash.slice(0, 12)) };
+    const result = win ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options);
+    if (result.canceled || !result.filePath) return { saved: false };
+    await fs.writeFile(result.filePath, bytes);
+    return { saved: true, path: result.filePath };
+  },
+
+  // External image save: dialog first (a cancel never downloads), then main
+  // fetches the bytes — the renderer cannot cross-origin. https only.
+  'spaces:saveImageUrl': async (event, args) => {
+    const url = new URL(args.url);
+    if (url.protocol !== 'https:') throw new Error('only https images can be saved');
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const options = { defaultPath: path.basename(url.pathname) || 'image' };
+    const result = win ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options);
+    if (result.canceled || !result.filePath) return { saved: false };
+    const res = await fetch(args.url);
+    if (!res.ok) throw new Error(`image fetch failed with ${res.status}`);
+    await fs.writeFile(result.filePath, Buffer.from(await res.arrayBuffer()));
+    return { saved: true, path: result.filePath };
+  },
+
+  'spaces:linkPreview': async (_event, args) => ({ preview: await fetchLinkPreview(args.url) }),
+
+  'spaces:readAsset': async (_event, args) =>
+    orgs.getClient(args.orgId).readAsset(args.spaceId, args.assetId, args.version),
+
+  'spaces:proposeChange': async (_event, args) =>
+    orgs.getClient(args.orgId).proposeChange(args.spaceId, {
+      assetId: args.input.assetId,
+      baseVersion: args.input.baseVersion,
+      // Exactly one of the two variants (contract decision 1, amended).
+      ...(args.input.blob !== undefined ? { blob: args.input.blob } : { newContent: args.input.newContent ?? '' }),
+      ...(args.input.reason ? { reason: args.input.reason } : {}),
+      actingMode: 'direct',
+    }),
+
+  'spaces:assetHistory': async (_event, args) => ({
+    changeSets: await orgs.getClient(args.orgId).assetHistory(args.spaceId, {
+      ...(args.assetId !== undefined ? { assetId: args.assetId } : {}),
+      ...(args.beforeOffset !== undefined ? { beforeOffset: args.beforeOffset } : {}),
+      ...(args.limit !== undefined ? { limit: args.limit } : {}),
+    }),
+  }),
+
+  'spaces:diff': async (_event, args) => ({
+    unified: await orgs.getClient(args.orgId).diff(args.spaceId, args.assetId, args.from, args.to),
+  }),
+
+  'spaces:listTopics': async (_event, args) => ({
+    topics: await orgs.getClient(args.orgId).listTopics(args.spaceId, args.includeArchived ?? false),
+  }),
+
+  'spaces:search': async (_event, args) =>
+    orgs.getClient(args.orgId).search(args.spaceId, {
+      q: args.q,
+      ...(args.kinds !== undefined ? { kinds: args.kinds } : {}),
+      ...(args.limit !== undefined ? { limit: args.limit } : {}),
+    }),
+
+  'spaces:listStream': async (_event, args) =>
+    orgs.getClient(args.orgId).listStream(args.spaceId, {
+      ...(args.beforeOffset !== undefined ? { beforeOffset: args.beforeOffset } : {}),
+      ...(args.afterOffset !== undefined ? { afterOffset: args.afterOffset } : {}),
+      ...(args.aroundOffset !== undefined ? { aroundOffset: args.aroundOffset } : {}),
+      ...(args.limit !== undefined ? { limit: args.limit } : {}),
+    }),
+
+  'spaces:getMessage': async (_event, args) => ({
+    message: await orgs.getClient(args.orgId).getMessage(args.spaceId, args.messageId),
+  }),
+
+  'spaces:listThread': async (_event, args) =>
+    orgs.getClient(args.orgId).listThread(args.spaceId, args.rootMessageId, {
+      ...(args.beforeOffset !== undefined ? { beforeOffset: args.beforeOffset } : {}),
+      ...(args.afterOffset !== undefined ? { afterOffset: args.afterOffset } : {}),
+      ...(args.aroundOffset !== undefined ? { aroundOffset: args.aroundOffset } : {}),
+      ...(args.limit !== undefined ? { limit: args.limit } : {}),
+    }),
+
+  'spaces:postMessage': async (_event, args) =>
+    orgs.getClient(args.orgId).postMessage(args.spaceId, {
+      ...(args.threadRoot ? { threadRoot: args.threadRoot } : {}),
+      ...(args.anchorChangeSetId ? { anchorChangeSetId: args.anchorChangeSetId } : {}),
+      body: args.body,
+      ...(args.poll ? { poll: args.poll } : {}),
+      actingMode: 'direct',
+    }),
+
+  'spaces:createTopic': async (_event, args) =>
+    orgs.getClient(args.orgId).createTopic(args.spaceId, {
+      ...(args.rootMessageId ? { rootMessageId: args.rootMessageId } : {}),
+      title: args.title,
+      ...(args.body ? { body: args.body } : {}),
+      ...(args.documentAssetId ? { documentAssetId: args.documentAssetId } : {}),
+      actingMode: 'direct',
+    }),
+
+  'spaces:manageTopic': async (_event, args) => ({
+    topic: await orgs.getClient(args.orgId).manageTopic(args.spaceId, args.topicId, { ...args.action, actingMode: 'direct' }),
+  }),
+
+  'spaces:reactToMessage': async (_event, args) => ({
+    message: await orgs.getClient(args.orgId).reactToMessage(args.spaceId, args.messageId, {
+      emoji: args.emoji,
+      action: args.action,
+      actingMode: 'direct',
+    }),
+  }),
+
+  'spaces:deleteMessage': async (_event, args) => ({
+    message: await orgs.getClient(args.orgId).deleteMessage(args.spaceId, args.messageId, {
+      actingMode: 'direct',
+    }),
+  }),
+
+  'spaces:editMessage': async (_event, args) => ({
+    message: await orgs.getClient(args.orgId).editMessage(args.spaceId, args.messageId, {
+      body: args.body,
+      actingMode: 'direct',
+    }),
+  }),
+
+  'spaces:votePoll': async (_event, args) => ({
+    message: await orgs.getClient(args.orgId).votePoll(args.spaceId, args.messageId, {
+      answerId: args.answerId,
+      action: args.action,
+      actingMode: 'direct',
+    }),
+  }),
+
+  'spaces:endPoll': async (_event, args) => ({
+    message: await orgs.getClient(args.orgId).endPoll(args.spaceId, args.messageId, {
+      actingMode: 'direct',
+    }),
+  }),
+
+  'spaces:invokeMythril': async (_event, args) => invokeTopicAgent(args),
+
+  'spaces:topicSession': async (_event, args) => ({
+    sessionId: topicSessionId(args.orgId, args.spaceId, args.threadRootId),
+  }),
+
+  'spaces:responseSession': async (_event, args) => resolveResponseSession(args),
+
+  'spaces:stopMythril': async (_event, args) => stopTopicAgent(args),
+
+  // Read state: the org owns the cursors (offsets, per member) — pass-throughs.
+  'spaces:markRead': async (_event, args) =>
+    orgs.getClient(args.orgId).markRead(args.spaceId, {
+      ...(args.threadRootId ? { threadRootId: args.threadRootId } : {}),
+      offset: args.offset,
+    }),
+
+  'spaces:followThread': async (_event, args) =>
+    orgs.getClient(args.orgId).followThread(args.spaceId, args.rootMessageId, args.following),
+
+  'spaces:getUnread': async (_event, args) => orgs.getClient(args.orgId).unread(),
+  'spaces:getActivity': async (_event, { orgId, ...query }) => orgs.getClient(orgId).activity(query),
+  'spaces:markActivitySeen': async (_event, args) => orgs.getClient(args.orgId).markActivitySeen(args.at),
+  'spaces:readAll': async (_event, args) => orgs.getClient(args.orgId).readAll(args.spaceId !== undefined ? { spaceId: args.spaceId } : {}),
+
+  'spaces:schedule': async (_event, args) => ({
+    id: scheduleItem({
+      kind: args.kind,
+      orgId: args.orgId,
+      spaceId: args.spaceId,
+      ...(args.threadRootId ? { threadRootId: args.threadRootId } : {}),
+      body: args.body,
+      at: args.at,
+    }).id,
+  }),
+
+  'spaces:listScheduled': async (_event, args) => ({ items: listScheduled(args.orgId, args.spaceId) }),
+
+  'spaces:cancelScheduled': async (_event, args) => {
+    cancelScheduled(args.id);
+    return { success: true };
+  },
+
+  'spaces:subscribeSpace': async (_event, args) => {
+    const key = `${args.orgId}/${args.spaceId}`;
+    const live = orgs.getLive(args.orgId);
+    const cached = liveSubscriptions.get(key);
+    // Instance check: a re-auth (upsertOAuthOrg) replaces the org's live
+    // client; a subscription cached on the dead one would eat frames forever.
+    if (!cached || cached.live !== live) {
+      cached?.unsubscribe();
+      const unsubscribe = live.subscribe(
+        args.spaceId,
+        (frame) => broadcastSpacesEvent({ orgId: args.orgId, frame }),
+        args.afterOffset,
+      );
+      liveSubscriptions.set(key, { live, unsubscribe });
+    }
+    return { success: true };
+  },
+
+  'spaces:unsubscribeSpace': async (_event, args) => {
+    const key = `${args.orgId}/${args.spaceId}`;
+    liveSubscriptions.get(key)?.unsubscribe();
+    liveSubscriptions.delete(key);
+    return { success: true };
+  },
+
+  'spaces:presence': async (_event, args) => {
+    orgs.getLive(args.orgId).presence(args.spaceId, args.state, args.threadRootId);
+    return { success: true };
+  },
+
+  // Fire-and-forget like presence; incoming whiteboard frames ride the same
+  // per-space live subscription and reach the renderer on 'spaces:events'.
+  'spaces:whiteboard': async (_event, args) => {
+    orgs.getLive(args.orgId).whiteboard(args.spaceId, args.boardId, args.payload);
+    return { success: true };
+  },
+
+  // In-process (kill-switch) parity for the wake bounce; in child/remote
+  // mode this channel forwards to the server, which owns the sockets.
+  'spaces:bounceLive': async () => {
+    orgs.bounceAllLive();
+    return { success: true };
+  },
+};

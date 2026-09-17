@@ -1,0 +1,15 @@
+node_modules/
+dist/
+out/
+release/
+.package/
+.pnpm-store/
+*.log
+images/
+.remember/
+.DS_Store
+Thumbs.db
+*.tsbuildinfo
+apps/x/apps/main/out/
+apps/x/apps/main/release/
+apps/x/apps/main/.package/
