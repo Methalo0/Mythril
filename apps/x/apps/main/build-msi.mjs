@@ -85,7 +85,7 @@ function buildDirTree() {
 const { body, compXml } = buildDirTree()
 const wxs2 = `<?xml version="1.0" encoding="utf-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Product Id="*" Name="Mythril" Language="1033" Version="${VERSION}" Manufacturer="MetHalo11885260" UpgradeCode="b7f3a1c2-4d5e-4f6a-9b8c-1d2e3f4a5b6c">
+  <Product Id="*" Name="Mythril" Language="1033" Version="${VERSION}" Manufacturer="MetHalo11885260" UpgradeCode="c8a4b2d3-5e6f-4a7b-8c9d-2e3f4a5b6c7d">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of Mythril is already installed." />
     <Media Id="1" Cabinet="mythril.cab" EmbedCab="yes" />
