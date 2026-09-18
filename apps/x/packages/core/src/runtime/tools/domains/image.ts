@@ -44,41 +44,93 @@ function ollamaV1BaseURL(baseURL: string | undefined): string {
 }
 
 // Workers AI image generation is NOT OpenAI-shaped: POST
-// /client/v4/accounts/{accountId}/ai/run/{model} with { prompt } returns raw
-// image bytes (or a JSON envelope carrying base64 for a few models). This
-// adapts that to the AI SDK ImageModel contract.
+// /client/v4/accounts/{accountId}/ai/run/{model} returns raw image bytes (or
+// a JSON envelope carrying base64 for a few models). Pure text-to-image
+// models take JSON { prompt }; editing/inpainting models REQUIRE
+// multipart/form-data with the prompt plus input image(s) — they 400 with
+// "required properties at '/' are 'multipart'" otherwise.
+type CfFile = { data?: Uint8Array | string; base64Data?: string; uint8ArrayData?: Uint8Array; mediaType?: string };
+
+function fileToBytes(f: CfFile): Uint8Array | null {
+    if (f.uint8ArrayData) return f.uint8ArrayData;
+    if (f.data instanceof Uint8Array) return f.data;
+    const b64 = f.base64Data ?? (typeof f.data === "string" ? f.data : undefined);
+    return b64 ? new Uint8Array(Buffer.from(b64, "base64")) : null;
+}
+
 function makeCloudflareImageModel(config: z.infer<typeof LlmProvider>, modelId: string): ImageModel {
     const account = config.accountId ?? "";
     const runUrl = `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/${modelId}`;
+
+    async function parseImageResponse(res: Response): Promise<Uint8Array> {
+        const contentType = res.headers.get("content-type") ?? "";
+        if (contentType.includes("json")) {
+            const data = await res.json() as { result?: { image?: string } };
+            if (!data.result?.image) throw new Error("Cloudflare returned no image");
+            return new Uint8Array(Buffer.from(data.result.image, "base64"));
+        }
+        return new Uint8Array(await res.arrayBuffer());
+    }
+
     return {
         specificationVersion: "v3",
         provider: "cloudflare",
         modelId,
         maxImagesPerCall: 1,
-        async doGenerate(options: { prompt?: string }) {
-            const res = await fetch(runUrl, {
+        async doGenerate(options: {
+            prompt?: string;
+            files?: CfFile[];
+            mask?: CfFile;
+        }) {
+            const prompt = options.prompt ?? "";
+            const inputImages = (options.files ?? [])
+                .map(fileToBytes)
+                .filter((b): b is Uint8Array => !!b);
+            const maskBytes = options.mask ? fileToBytes(options.mask) : null;
+
+            const sendJson = () => fetch(runUrl, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                     Authorization: `Bearer ${config.apiKey ?? ""}`,
                 },
-                body: JSON.stringify({ prompt: options.prompt ?? "" }),
+                body: JSON.stringify({ prompt }),
             });
+
+            const sendMultipart = () => {
+                const form = new FormData();
+                form.append("prompt", prompt);
+                // Cloudflare conventions: single edit image is `image`;
+                // multi-reference models (flux-2-*) take input_image_1..N;
+                // inpainting adds `mask`.
+                inputImages.forEach((bytes, i) => {
+                    const name = inputImages.length === 1 ? "image" : `input_image_${i + 1}`;
+                    form.append(name, new Blob([new Uint8Array(bytes)], { type: "image/png" }), `input-${i + 1}.png`);
+                });
+                if (maskBytes) form.append("mask", new Blob([new Uint8Array(maskBytes)], { type: "image/png" }), "mask.png");
+                return fetch(runUrl, {
+                    method: "POST",
+                    headers: { Authorization: `Bearer ${config.apiKey ?? ""}` },
+                    body: form,
+                });
+            };
+
+            // Attached images force multipart up front; pure text goes JSON
+            // first and falls back to multipart on Cloudflare's telltale 400.
+            let res = inputImages.length || maskBytes ? await sendMultipart() : await sendJson();
+            if (!res.ok && !inputImages.length && !maskBytes && res.status === 400) {
+                const body = await res.text().catch(() => "");
+                if (!body.includes("multipart")) {
+                    throw new Error(`Cloudflare image generation failed (HTTP 400): ${body.slice(0, 300)}`);
+                }
+                res = await sendMultipart();
+            }
             if (!res.ok) {
                 const body = await res.text().catch(() => "");
                 throw new Error(`Cloudflare image generation failed (HTTP ${res.status}): ${body.slice(0, 300)}`);
             }
-            const contentType = res.headers.get("content-type") ?? "";
-            let bytes: Uint8Array;
-            if (contentType.includes("json")) {
-                const data = await res.json() as { result?: { image?: string } };
-                if (!data.result?.image) throw new Error("Cloudflare returned no image");
-                bytes = new Uint8Array(Buffer.from(data.result.image, "base64"));
-            } else {
-                bytes = new Uint8Array(await res.arrayBuffer());
-            }
             return {
-                images: [bytes],
+                images: [await parseImageResponse(res)],
                 warnings: [],
                 response: { timestamp: new Date(), modelId, headers: undefined },
             };
@@ -349,7 +401,7 @@ function formatWarnings(warnings: Warning[]): string[] {
 async function runImageGeneration(
     backend: ImageBackend,
     modelId: string,
-    prompt: string,
+    prompt: string | { images: Uint8Array[]; text?: string },
     aspectRatio: `${number}:${number}` | undefined,
     signal: AbortSignal | undefined,
 ): Promise<{ image: GeneratedFile; warnings: string[] }> {
@@ -407,12 +459,13 @@ export const imageTools: z.infer<typeof BuiltinToolsSchema> = {
         inputSchema: z.object({
             prompt: z.string().describe('A vivid, self-contained description of the image to generate. Include the subject, style, setting, and any important details.'),
             filename: z.string().optional().describe('Short kebab-case basename for the saved file, without extension (e.g. "sunset-over-lake"). Derived from the prompt when omitted.'),
+            imagePath: z.string().optional().describe('Absolute path to an existing image to edit or use as a reference (editing models like flux-2 only). Omit for plain text-to-image.'),
             aspectRatio: z.string().optional().describe('Aspect ratio of the image as width:height — common values are "1:1", "16:9", "9:16", "4:3" — or "auto". Only pass this when the user asks for a specific shape.'),
             model: z.string().optional().describe('Image model id to use INSTEAD of the configured one, on the SAME configured provider (the provider cannot be changed per call). Use that provider\'s naming: Mythril gateway / OpenRouter "vendor/model" (e.g. "google/gemini-2.5-flash-image", "x-ai/grok-imagine-image-quality", "bytedance-seed/seedream-4.5"), Google "gemini-…" (e.g. "gemini-2.5-flash-image"), OpenAI "gpt-image-…", Ollama a locally pulled model name. Pass ONLY when the user explicitly names an image model (e.g. "use gpt-image-1", "make it with Grok"); omit otherwise to use the configured model.'),
         }),
         isAvailable: async () => (await resolveImageBackend()).ok,
         execute: async (
-            { prompt, filename, aspectRatio, model }: { prompt: string; filename?: string; aspectRatio?: string; model?: string },
+            { prompt, filename, aspectRatio, model, imagePath }: { prompt: string; filename?: string; aspectRatio?: string; model?: string; imagePath?: string },
             ctx?: ToolContext,
         ) => {
             const signal = ctx?.signal;
@@ -448,7 +501,16 @@ export const imageTools: z.infer<typeof BuiltinToolsSchema> = {
             const modelId = modelOverride ?? resolved.model;
 
             try {
-                const { image, warnings } = await runImageGeneration(backend, modelId, prompt, aspect, signal);
+                let inputImage: Uint8Array | null = null;
+                if (imagePath) {
+                    try {
+                        inputImage = new Uint8Array(await fs.readFile(imagePath));
+                    } catch {
+                        return { success: false, error: `Could not read image at ${imagePath}` };
+                    }
+                }
+                const promptPayload = inputImage ? { images: [inputImage], text: prompt } : prompt;
+                const { image, warnings } = await runImageGeneration(backend, modelId, promptPayload, aspect, signal);
                 const filePath = await saveGeneratedImage(image, filename, prompt);
                 return {
                     success: true,
