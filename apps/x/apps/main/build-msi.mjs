@@ -10,7 +10,7 @@ const ROOT = path.dirname(new URL(import.meta.url).pathname).replace(/^\/([A-Za-
 const APP_DIR = path.join(ROOT, 'out', 'Mythril-win32-x64')
 const OUT_DIR = path.join(ROOT, 'release')
 const WIX_DIR = path.join(process.env.LOCALAPPDATA, 'electron-builder', 'Cache', 'wix-4.0.0.5512.2', 'wix-4.0.0.5512.2-1xm13')
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 
 if (!fs.existsSync(path.join(APP_DIR, 'mythril.exe'))) {
   console.error('Packaged app not found — run electron-forge package first')

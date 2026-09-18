@@ -263,7 +263,7 @@ module.exports = {
         // would break in packaged builds.
         ignore: (p) => {
             if (p === '/.package' || p.startsWith('/.package/')) return false;
-            return [/^\/src\//, /^\/node_modules\//, /\.gitignore/, /bundle\.mjs/, /tsconfig\.json/]
+            return [/^\/src\//, /^\/node_modules\//, /^\/release\//, /^\/out\//, /\.gitignore/, /bundle\.mjs/, /tsconfig\.json/, /\.log$/, /\.msi$/, /\.wxs$/, /\.wixobj$/]
                 .some((re) => re.test(p));
         },
     },
