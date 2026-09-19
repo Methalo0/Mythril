@@ -14,3 +14,4 @@ apps/x/apps/main/out/
 apps/x/apps/main/release/
 apps/x/apps/main/.package/
 fix-install.ps1
+patch-*.cjs

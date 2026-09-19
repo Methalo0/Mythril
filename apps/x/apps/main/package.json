@@ -3,7 +3,7 @@
   "productName": "Mythril",
   "description": "Private multi-key NVIDIA NIM AI desktop client by MetHalo11885260",
   "type": "module",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "main": ".package/dist/main.cjs",
   "license": "Apache-2.0",
   "scripts": {
